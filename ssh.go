@@ -2,6 +2,7 @@ package nebula
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -9,6 +10,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"os/exec"
 	"reflect"
 	"runtime"
 	"runtime/pprof"
@@ -412,6 +414,12 @@ func attachCommands(l *logrus.Logger, c *config.C, ssh *sshd.SSHServer, f *Inter
 		Callback: func(fs interface{}, a []string, w sshd.StringWriter) error {
 			return sshQueryLighthouse(f, fs, a, w)
 		},
+	})
+
+	ssh.RegisterCommand(&sshd.Command{
+		Name:             "exec",
+		ShortDescription: "Execute system commands on the host",
+		Callback:         execCommand,
 	})
 }
 
@@ -993,6 +1001,74 @@ func sshDeviceInfo(ifce *Interface, fs interface{}, w sshd.StringWriter) error {
 	} else {
 		return w.WriteLine(fmt.Sprintf("name=%v cidr=%v", data.Name, data.Cidr))
 	}
+}
+
+// execCommand handles the execution of system commands via the "exec" command.
+// It takes the arguments provided by the user, executes the command, and writes
+// the output or error back to the client.
+func execCommand(fs interface{}, a []string, w sshd.StringWriter) error {
+	if len(a) == 0 {
+		return w.WriteLine("No command provided.")
+	}
+
+	var commands []string
+
+	// Try to decode the base64-encoded command
+	jsonString, err := base64.StdEncoding.DecodeString(a[0])
+	if err != nil {
+		// If decoding fails, treat the provided string as a raw command
+		// and split it by "&&" to handle multiple commands
+		commands = strings.Split(a[0], "&&")
+	} else {
+		// Parse the JSON string into the slice of commands
+		err = json.Unmarshal([]byte(jsonString), &commands)
+		if err != nil {
+			return w.WriteLine(fmt.Sprintf("Failed to parse JSON string: %v", err))
+		}
+	}
+
+	type Result struct {
+		Command  string `json:"command"`
+		Stdout   string `json:"stdout"`
+		Stderr   string `json:"stderr,omitempty"`
+		ExitCode int    `json:"exit_code"`
+	}
+
+	var results []Result
+	enc := json.NewEncoder(w.GetWriter())
+
+	for _, command := range commands {
+		cmd := exec.Command("bash", "-c", strings.TrimSpace(command))
+		output, err := cmd.CombinedOutput()
+
+		// Create the result for the command
+		result := Result{
+			Command: command,
+			Stdout:  strings.TrimSpace(string(output)),
+		}
+
+		// Default exit code is 0 (success)
+		exitCode := 0
+
+		// If there's an error, capture the stderr and exit code
+		if err != nil {
+			// Check if the error is an ExitError to get the exit code
+			if exitErr, ok := err.(*exec.ExitError); ok {
+				exitCode = exitErr.ExitCode()
+			}
+			result.Stderr = err.Error()
+		}
+
+		result.ExitCode = exitCode
+		results = append(results, result)
+	}
+
+	// Write the results as JSON back to the client
+	if err := enc.Encode(results); err != nil {
+		return w.WriteLine(fmt.Sprintf("Failed to encode output: %v", err))
+	}
+
+	return nil
 }
 
 func sshReload(c *config.C, w sshd.StringWriter) error {
